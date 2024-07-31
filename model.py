@@ -1,16 +1,17 @@
 import numpy as np
+from tqdm import tqdm
 
 class ConvolutionalLayer:
-    def __init__(self, num_channels,num_filters, filter_size, stride, padding):
+    def __init__(self, num_channels, num_filters, filter_size, stride, padding):
         self.num_filters = num_filters
         self.filter_size = filter_size
         self.stride = stride
         self.padding = padding
-        self.filters = np.random.randn(num_filters, filter_size, filter_size, num_channels) / (filter_size * filter_size)
+        self.filters = np.random.randn(num_filters, filter_size, filter_size, num_channels) * np.sqrt(2.0 / (filter_size * filter_size * num_channels))
 
     def forward(self, image):
         self.last_input = image
-        self.input_padded = np.pad(image, [(0,0), (self.padding, self.padding), (self.padding, self.padding), (0,0)], mode='constant')
+        self.input_padded = np.pad(image, [(0, 0), (self.padding, self.padding), (self.padding, self.padding), (0, 0)], mode='constant')
 
         batch_size, h, w, _ = image.shape
         self.batch_size = batch_size
@@ -22,10 +23,9 @@ class ConvolutionalLayer:
 
         for i in range(output_height):
             for j in range(output_width):
-                for k in range(self.num_filters):
-                    region = self.input_padded[:, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, :]
-                    output[:, i, j, k] = np.sum(region * self.filters[k, :, :, :], axis=(1,2,3))
-
+                region = self.input_padded[:, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, :]
+                output[:, i, j, :] = np.tensordot(region, self.filters, axes=([1, 2, 3], [1, 2, 3]))
+        
         return output
     
     def backward(self, d_output, learning_rate):
@@ -36,18 +36,18 @@ class ConvolutionalLayer:
 
         for i in range(output_height):
             for j in range(output_width):
+                region = self.input_padded[:, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, :]
                 for k in range(self.num_filters):
-                    region = self.input_padded[:, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, :]
-                    d_filters[k, :, :, :] += np.sum(region * d_output[:, i, j, k][:, None, None, None], axis=0)
-                    d_input_padded[:, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, :] += self.filters[k, :, :, :] * d_output[:, i, j, k][:, None, None, None]
-
+                    d_filters[k] += np.tensordot(region, d_output[:, i, j, k], axes=([0], [0]))
+                for n in range(batch_size):
+                    d_input_padded[n, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, :] += np.sum(self.filters * (d_output[n, i, j, :, None, None, None]), axis=0)
+        
         self.filters -= learning_rate * d_filters / batch_size
 
         if self.padding == 0:
             return d_input_padded
         else:
             return d_input_padded[:, self.padding:-self.padding, self.padding:-self.padding, :]
-
 
 class MaxPoolingLayer:
     def __init__(self, filter_size, stride):
@@ -60,19 +60,12 @@ class MaxPoolingLayer:
         h_out = (h - self.filter_size) // self.stride + 1
         w_out = (w - self.filter_size) // self.stride + 1
         
-        if h_out <= 0 or w_out <= 0:
-            raise ValueError("Invalid output dimensions. Adjust filter size or stride.")
-        
         self.output = np.zeros((batch_size, h_out, w_out, num_filters))
         
-        for n in range(batch_size):
-            for i in range(h_out):
-                for j in range(w_out):
-                    for k in range(num_filters):
-                        region = images[n, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, k]
-                        if region.size == 0:
-                            raise ValueError("Region size is zero. Adjust filter size or stride.")
-                        self.output[n, i, j, k] = np.max(region)
+        for i in range(h_out):
+            for j in range(w_out):
+                region = images[:, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, :]
+                self.output[:, i, j, :] = np.max(region, axis=(1, 2))
         
         return self.output
 
@@ -81,29 +74,27 @@ class MaxPoolingLayer:
         
         batch_size, h_out, w_out, num_filters = d_output.shape
         
-        for n in range(batch_size):
-            for i in range(h_out):
-                for j in range(w_out):
+        for i in range(h_out):
+            for j in range(w_out):
+                region = self.last_input[:, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, :]
+                max_region = np.max(region, axis=(1, 2))
+                for n in range(batch_size):
                     for k in range(num_filters):
-                        region = self.last_input[n, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, k]
-                        max_val = np.max(region)
-                        for m in range(self.filter_size):
-                            for p in range(self.filter_size):
-                                if region.size > 0 and region[m, p] == max_val:
-                                    d_input[n, i*self.stride+m, j*self.stride+p, k] = d_output[n, i, j, k]
+                        mask = (region[n, :, :, k] == max_region[n, k])
+                        d_input[n, i*self.stride:i*self.stride+self.filter_size, j*self.stride:j*self.stride+self.filter_size, k] += mask * d_output[n, i, j, k]
         
         return d_input
 
 class DenseLayer:
     def __init__(self, input_size, output_size):
-        self.weights = np.random.randn(input_size, output_size) * 0.01
+        self.weights = np.random.randn(input_size, output_size) * np.sqrt(2.0 / input_size)
         self.biases = np.zeros((1, output_size))
     
     def ReLU(self, x):
         return np.maximum(0, x)
     
     def ReLU_derivative(self, x):
-        return np.where(x > 0, 1, 0)
+        return (x > 0).astype(x.dtype)
     
     def forward(self, input):
         self.input = input
@@ -122,15 +113,59 @@ class DenseLayer:
         
         return d_input
 
+class BatchNormalizationLayer:
+    def __init__(self, num_features, epsilon=1e-5, momentum=0.9):
+        self.num_features = num_features
+        self.epsilon = epsilon
+        self.momentum = momentum
+        self.gamma = np.ones((1, 1, 1, num_features))
+        self.beta = np.zeros((1, 1, 1, num_features))
+        self.running_mean = np.zeros((1, 1, 1, num_features))
+        self.running_var = np.ones((1, 1, 1, num_features))
+
+    def forward(self, x, training=True):
+        if training:
+            batch_mean = np.mean(x, axis=(0, 1, 2), keepdims=True)
+            batch_var = np.var(x, axis=(0, 1, 2), keepdims=True)
+            self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * batch_mean
+            self.running_var = self.momentum * self.running_var + (1 - self.momentum) * batch_var
+            self.batch_mean = batch_mean
+            self.batch_var = batch_var
+        else:
+            batch_mean = self.running_mean
+            batch_var = self.running_var
+
+        self.x_centered = x - batch_mean
+        self.stddev_inv = 1. / np.sqrt(batch_var + self.epsilon)
+        self.x_normalized = self.x_centered * self.stddev_inv
+        out = self.gamma * self.x_normalized + self.beta
+        return out
+
+    def backward(self, d_out, learning_rate):
+        d_x_normalized = d_out * self.gamma
+        d_var = np.sum(d_x_normalized * self.x_centered, axis=(0, 1, 2)) * -0.5 * np.power(self.stddev_inv, 3)
+        d_mean = np.sum(d_x_normalized * -self.stddev_inv, axis=(0, 1, 2)) + d_var * np.mean(-2. * self.x_centered, axis=(0, 1, 2))
+        
+        d_x = (d_x_normalized * self.stddev_inv) + (d_var * 2 * self.x_centered / d_out.shape[0]) + (d_mean / d_out.shape[0])
+        d_gamma = np.sum(d_out * self.x_normalized, axis=(0, 1, 2))
+        d_beta = np.sum(d_out, axis=(0, 1, 2))
+
+        self.gamma -= learning_rate * d_gamma
+        self.beta -= learning_rate * d_beta
+
+        return d_x
+
 
 class CNN:
     def __init__(self):
         self.conv = ConvolutionalLayer(num_channels=1, num_filters=8, filter_size=3, stride=1, padding=1)
+        self.bn1 = BatchNormalizationLayer(num_features=8)
         self.pool = MaxPoolingLayer(filter_size=2, stride=2)
-        self.conv2 = ConvolutionalLayer(num_channels=8, num_filters=16, filter_size=3, stride=1, padding=1)
-        self.pool2 = MaxPoolingLayer(filter_size=2, stride=2)
-        self.fc1 = DenseLayer(7*7*16, output_size=128)
-        self.fc2 = DenseLayer(128, output_size=10)
+        #self.conv2 = ConvolutionalLayer(num_channels=8, num_filters=16, filter_size=3, stride=1, padding=1)
+        #self.bn2 = BatchNormalizationLayer(num_features=16)
+        #self.pool2 = MaxPoolingLayer(filter_size=2, stride=2)
+        self.fc1 = DenseLayer(14*14*8, 128)
+        self.fc2 = DenseLayer(128, 10)
     
     def softmax(self, x):
         exp_x = np.exp(x - np.max(x, axis=1, keepdims=True))
@@ -138,33 +173,26 @@ class CNN:
     
     def forward(self, images):
         conv_out = self.conv.forward(images)
-        pool_out = self.pool.forward(conv_out)
-        conv2_out = self.conv2.forward(pool_out)
-        pool2_out = self.pool2.forward(conv2_out)
-        flattened = pool2_out.reshape(pool2_out.shape[0], -1)
+        bn1_out = self.bn1.forward(conv_out)
+        pool_out = self.pool.forward(bn1_out)
+        
+        #conv2_out = self.conv2.forward(pool_out)
+        #bn2_out = self.bn2.forward(conv2_out)
+        #pool2_out = self.pool2.forward(bn2_out)
+        flattened = pool_out.reshape(pool_out.shape[0], -1)
         fc1_out = self.fc1.forward(flattened)
         fc2_out = self.fc2.forward(fc1_out)
         return self.softmax(fc2_out)
     
     def backward(self, d_output, learning_rate):
-        print("D_output", d_output.shape)
         d_output = self.fc2.backward(d_output, learning_rate)
-        print("D_output_FC2", d_output.shape)
         d_output = self.fc1.backward(d_output, learning_rate)
-        print("D_output_FC1", d_output.shape)
-        d_output = d_output.reshape(self.pool2.output.shape)
-        print("D_output_FC1_Reshape", d_output.shape)
-        d_output = self.pool2.backward(d_output)
-        print("D_output_Pool2", d_output.shape)
-        d_output = self.conv2.backward(d_output, learning_rate)
-        print("D_output_Conv2", d_output.shape)
+        d_output = d_output.reshape(self.pool.output.shape)
+        #d_output = self.pool2.backward(d_output)
+        #d_output = self.bn2.backward(d_output, learning_rate)
+        #d_output = self.conv2.backward(d_output, learning_rate)
         d_output = self.pool.backward(d_output)
-        print("D_output_Pool", d_output.shape)
+        d_output = self.bn1.backward(d_output, learning_rate)
         d_output = self.conv.backward(d_output, learning_rate)
-        print("D_output_Conv", d_output.shape)
         
         return d_output
-
-        
-        
- 

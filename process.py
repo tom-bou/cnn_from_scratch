@@ -1,5 +1,4 @@
 import numpy as np
-import csv
 
 def load_dataset():
     # Load the training data
